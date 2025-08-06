@@ -1,0 +1,197 @@
+---
+title: "Different Cluster Experiments"
+author: "David Liu"
+date: "2025-07-01"
+output: word_document
+---
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(queueing)
+
+# === Load Data ===
+dat_P <- read.csv("dat_P_sub_c.csv")
+future_dat <- read.csv("years20262030.csv")
+
+# === Process Original Data to Create lambda_hat and Clusters ===
+dat_P <- dat_P %>%
+  mutate(S2 = ymd_hm(S2), hour = floor_date(S2, "hour")) %>%
+  count(hour, name = "n_arrivals") %>%
+  mutate(lambda_hat = 0.0085 * n_arrivals)
+
+# K-means clustering on lambda_hat with k = 4
+set.seed(123)
+k <- 4
+km <- kmeans(dat_P$lambda_hat, centers = k)
+dat_P$cluster <- km$cluster
+cluster_means <- dat_P %>% group_by(cluster) %>% summarise(lambda_mean = mean(lambda_hat))
+
+# === Fit M/M/c Model Per Cluster ===
+target_prob <- 0.85
+service_rate <- 1/5  # μ = 1/5 mins
+
+find_optimal_c <- function(lambda, mu = service_rate, threshold = target_prob) {
+  for (c in 1:20) {
+    mmc <- NewInput.MMC(lambda = lambda, mu = mu, c = c)
+    tryCatch({
+      model <- QueueingModel(mmc)
+      prob_under_15 <- 1 - exp(-mu * c * 15)  # approx prob Wq + 1/μ < 15 mins
+      if (prob_under_15 >= threshold) return(c)
+    }, error = function(e) {})
+  }
+  return(NA)
+}
+
+cluster_means <- cluster_means %>%
+  rowwise() %>%
+  mutate(opt_c = find_optimal_c(lambda_mean))
+
+# === Process Future Data ===
+future_dat <- future_dat %>%
+  mutate(S2 = ymd_hm(S2), hour = floor_date(S2, "hour")) %>%
+  count(hour, name = "n_arrivals") %>%
+  mutate(lambda_hat = 0.0085 * n_arrivals)
+
+# Assign each future hour to the closest cluster (by lambda_hat)
+future_dat$cluster <- sapply(future_dat$lambda_hat, function(l) {
+  which.min(abs(cluster_means$lambda_mean - l))
+})
+
+# Merge in optimal c values
+future_dat <- future_dat %>%
+  left_join(cluster_means, by = "cluster")
+
+# === Evaluate Model Performance ===
+check_mm_c_met <- function(lambda, c, mu = service_rate) {
+  tryCatch({
+    model <- QueueingModel(NewInput.MMC(lambda = lambda, mu = mu, c = c))
+    prob_under_15 <- 1 - exp(-mu * c * 15)
+    return(prob_under_15 >= target_prob)
+  }, error = function(e) FALSE)
+}
+
+# Apply to each row
+future_dat <- future_dat %>%
+  rowwise() %>%
+  mutate(met_target = check_mm_c_met(lambda_hat, opt_c))
+
+# === Summarize by Cluster ===
+summary <- future_dat %>%
+  group_by(cluster) %>%
+  summarise(
+    Lambda_Mean = mean(lambda_hat),
+    Optimal_c = first(opt_c),
+    Prop_Hours_Met = mean(met_target)
+  )
+
+print(summary)
+
+```
+
+```{r}
+# Load libraries
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(queueing)
+
+# Load the datasets
+df_p <- read.csv("dat_P_sub_c.csv")
+df_test <- read.csv("years20262030.csv")
+
+# Step 1: Compute lambda_hat per hour
+df_lambda <- df_p %>%
+  mutate(S2 = ymd_hm(S2),
+         hour = floor_date(S2, "hour")) %>%
+  count(hour, name = "n_arrivals") %>%
+  mutate(lambda_hat = 0.0085 * n_arrivals)
+
+# Step 2: K-means clustering of lambda_hat into 4 clusters
+set.seed(123)
+k <- 4
+km <- kmeans(df_lambda$lambda_hat, centers = k)
+df_lambda$cluster <- km$cluster
+
+# Step 3: Compute mean lambda for each cluster
+cluster_summary <- df_lambda %>%
+  group_by(cluster) %>%
+  summarise(Lambda_Mean = mean(lambda_hat)) %>%
+  mutate(Optimal_c = NA, Prop_Passengers_Met = NA)
+
+# Step 4: Prepare the test data
+df_test <- df_test %>%
+  mutate(S2 = ymd_hm(S2),
+         hour = floor_date(S2, "hour"))
+
+test_hourly <- df_test %>%
+  count(hour, name = "n_arrivals") %>%
+  mutate(lambda_hat = 0.0085 * n_arrivals)
+
+# Step 5: Assign clusters from training model to test data
+test_hourly$cluster <- predict(km, newdata = test_hourly$lambda_hat) # Requires helper
+# If 'predict.kmeans' is unavailable, assign manually
+test_hourly$cluster <- apply(test_hourly["lambda_hat"], 1, function(x) {
+  which.min((x - km$centers)^2)
+})
+
+# Step 6: Join cluster assignments back to test data
+df_test <- df_test %>%
+  mutate(S2 = ymd_hm(S2),
+         hour = floor_date(S2, "hour")) %>%
+  left_join(test_hourly[, c("hour", "cluster", "lambda_hat")], by = "hour")
+
+# Step 7: For each cluster, find optimal c and measure performance
+mu <- 1 / 60  # 1 passenger per minute
+target_time <- 15 / 60  # 15 minutes in hours
+target_prob <- 0.85
+
+for (i in 1:nrow(cluster_summary)) {
+  lambda_val <- cluster_summary$Lambda_Mean[i]
+  
+  found_c <- FALSE
+  for (c in 1:20) {
+    tryCatch({
+      input <- NewInput.MMC(lambda = lambda_val, mu = mu, c = c)
+      model <- QueueingModel(input)
+      wait_prob <- model$Wq  # Average waiting time in queue
+      served_prob <- pexp(target_time, rate = mu - (lambda_val / c))  # Exponential assumption
+      
+      if (served_prob >= target_prob) {
+        cluster_summary$Optimal_c[i] <- c
+        found_c <- TRUE
+        break
+      }
+    }, error = function(e) {})
+  }
+  
+  if (!found_c) next
+}
+
+# Step 8: Evaluate on test data — passenger-level check
+performance <- df_test %>%
+  left_join(cluster_summary[, c("cluster", "Optimal_c", "Lambda_Mean")], by = "cluster") %>%
+  filter(!is.na(Optimal_c)) %>%
+  mutate(
+    mu = 1 / 60,
+    lambda = Lambda_Mean,
+    ro = lambda / (Optimal_c * mu),
+    served_prob = pexp(target_time, rate = mu - (lambda / Optimal_c))
+  )
+
+# Step 9: For each passenger, determine if they were likely served within 15 minutes
+# Assume all passengers in hour share the same served_prob
+performance_summary <- performance %>%
+  group_by(cluster) %>%
+  summarise(
+    Lambda_Mean = first(Lambda_Mean),
+    Optimal_c = first(Optimal_c),
+    Prop_Passengers_Met = mean(served_prob >= target_prob)
+  )
+
+# Step 10: Show result
+print(performance_summary)
+
+```
+
