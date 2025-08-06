@@ -1,0 +1,94 @@
+---
+title: "Different Cluster Experiments"
+author: "David Liu"
+date: "2025-07-01"
+output: word_document
+---
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(queueing)
+
+# === Load Data ===
+dat_P <- read.csv("dat_P_sub_c.csv")
+future_dat <- read.csv("years20262030.csv")
+
+# === Process Original Data to Create lambda_hat and Clusters ===
+dat_P <- dat_P %>%
+  mutate(S2 = ymd_hm(S2), hour = floor_date(S2, "hour")) %>%
+  count(hour, name = "n_arrivals") %>%
+  mutate(lambda_hat = 0.0085 * n_arrivals)
+
+# K-means clustering on lambda_hat with k = 4
+set.seed(123)
+k <- 4
+km <- kmeans(dat_P$lambda_hat, centers = k)
+dat_P$cluster <- km$cluster
+cluster_means <- dat_P %>% group_by(cluster) %>% summarise(lambda_mean = mean(lambda_hat))
+
+# === Fit M/M/c Model Per Cluster ===
+target_prob <- 0.85
+service_rate <- 1/5  # μ = 1/5 mins
+
+find_optimal_c <- function(lambda, mu = service_rate, threshold = target_prob) {
+  for (c in 1:20) {
+    mmc <- NewInput.MMC(lambda = lambda, mu = mu, c = c)
+    tryCatch({
+      model <- QueueingModel(mmc)
+      prob_under_15 <- 1 - exp(-mu * c * 15)  # approx prob Wq + 1/μ < 15 mins
+      if (prob_under_15 >= threshold) return(c)
+    }, error = function(e) {})
+  }
+  return(NA)
+}
+
+cluster_means <- cluster_means %>%
+  rowwise() %>%
+  mutate(opt_c = find_optimal_c(lambda_mean))
+
+# === Process Future Data ===
+future_dat <- future_dat %>%
+  mutate(S2 = ymd_hm(S2), hour = floor_date(S2, "hour")) %>%
+  count(hour, name = "n_arrivals") %>%
+  mutate(lambda_hat = 0.0085 * n_arrivals)
+
+# Assign each future hour to the closest cluster (by lambda_hat)
+future_dat$cluster <- sapply(future_dat$lambda_hat, function(l) {
+  which.min(abs(cluster_means$lambda_mean - l))
+})
+
+# Merge in optimal c values
+future_dat <- future_dat %>%
+  left_join(cluster_means, by = "cluster")
+
+# === Evaluate Model Performance ===
+check_mm_c_met <- function(lambda, c, mu = service_rate) {
+  tryCatch({
+    model <- QueueingModel(NewInput.MMC(lambda = lambda, mu = mu, c = c))
+    prob_under_15 <- 1 - exp(-mu * c * 15)
+    return(prob_under_15 >= target_prob)
+  }, error = function(e) FALSE)
+}
+
+# Apply to each row
+future_dat <- future_dat %>%
+  rowwise() %>%
+  mutate(met_target = check_mm_c_met(lambda_hat, opt_c))
+
+# === Summarize by Cluster ===
+summary <- future_dat %>%
+  group_by(cluster) %>%
+  summarise(
+    Lambda_Mean = mean(lambda_hat),
+    Optimal_c = first(opt_c),
+    Prop_Hours_Met = mean(met_target)
+  )
+
+print(summary)
+
+```
+
+
+
